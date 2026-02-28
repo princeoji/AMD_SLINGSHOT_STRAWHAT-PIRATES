@@ -1,20 +1,26 @@
 /**
- * HeatShield AI - Main Dashboard Application
+ * HeatShield AI - Main Dashboard Application (Real-Time)
  * Heatwave Risk Intelligence Platform
  *
  * A smart city / climate analytics dashboard for predicting and
  * visualizing heatwave risk levels across India.
+ *
+ * Uses Socket.IO WebSocket for live data push every 30 seconds.
  */
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import HeatRiskScore from './components/HeatRiskScore';
 import ForecastChart from './components/ForecastChart';
 import IndiaHeatmap from './components/IndiaHeatmap';
 import AdvisoryPanel from './components/AdvisoryPanel';
 import LocationSelector from './components/LocationSelector';
-import { getCities, getRiskPrediction, getAllCityRisks, get7DayForecast } from './services/api';
+import {
+    getCities, getRiskPrediction, getAllCityRisks, get7DayForecast,
+    connectSocket, disconnectSocket, onWeatherUpdate, onConnectionChange,
+    requestCityUpdate, onCityUpdate,
+} from './services/api';
 
-const REFRESH_INTERVAL = 60000; // 1 minute
+const FALLBACK_REFRESH_INTERVAL = 300000; // 5 min backup polling
 
 export default function App() {
     const [cities, setCities] = useState([]);
@@ -25,8 +31,16 @@ export default function App() {
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
     const [lastUpdated, setLastUpdated] = useState(null);
+    const [isConnected, setIsConnected] = useState(false);
+    const [dataSource, setDataSource] = useState('unknown');
+    const selectedCityRef = useRef(selectedCity);
 
-    // Fetch all data for a city
+    // Keep ref in sync with state for use inside callbacks
+    useEffect(() => {
+        selectedCityRef.current = selectedCity;
+    }, [selectedCity]);
+
+    // Fetch all data for a city (REST fallback)
     const fetchData = useCallback(async (city) => {
         setLoading(true);
         setError(null);
@@ -40,6 +54,7 @@ export default function App() {
             setForecast(forecastData);
             setAllCityRisks(allRisks);
             setLastUpdated(new Date());
+            if (risk?.weather?.source) setDataSource(risk.weather.source);
         } catch (err) {
             console.error('Failed to fetch data:', err);
             setError('Failed to connect to the backend. Make sure the server is running on port 5000.');
@@ -53,16 +68,84 @@ export default function App() {
         getCities().then(setCities);
     }, []);
 
-    // Fetch data when city changes
+    // Fetch data when city changes (initial + on city switch)
     useEffect(() => {
         fetchData(selectedCity);
     }, [selectedCity, fetchData]);
 
-    // Auto-refresh
+    // ─── REAL-TIME WEBSOCKET CONNECTION ────────────────────────
     useEffect(() => {
-        const interval = setInterval(() => fetchData(selectedCity), REFRESH_INTERVAL);
+        const socket = connectSocket();
+
+        // Connection state tracking
+        const unsubConnection = onConnectionChange(
+            () => setIsConnected(true),
+            () => setIsConnected(false)
+        );
+
+        // If already connected at mount
+        if (socket.connected) setIsConnected(true);
+
+        // Listen for broadcast weather updates (all cities)
+        const unsubWeather = onWeatherUpdate((payload) => {
+            if (!payload?.data) return;
+
+            // Update all-city heatmap data
+            setAllCityRisks(payload.data);
+            setLastUpdated(new Date(payload.timestamp));
+            setDataSource(payload.source || 'live');
+
+            // Also update the currently selected city's risk data
+            const currentCity = selectedCityRef.current;
+            const cityData = payload.data.find(c => c.city === currentCity);
+            if (cityData) {
+                setRiskData({
+                    weather: cityData.weather,
+                    prediction: cityData.prediction,
+                    city: currentCity,
+                    timestamp: payload.timestamp,
+                });
+            }
+
+            setLoading(false);
+            setError(null);
+        });
+
+        // Listen for on-demand single-city updates
+        const unsubCity = onCityUpdate((data) => {
+            if (data.city === selectedCityRef.current) {
+                setRiskData({
+                    weather: data.weather,
+                    prediction: data.prediction,
+                    city: data.city,
+                    timestamp: data.timestamp,
+                });
+                setLastUpdated(new Date(data.timestamp));
+            }
+        });
+
+        return () => {
+            unsubConnection();
+            unsubWeather();
+            unsubCity();
+            disconnectSocket();
+        };
+    }, []); // only once on mount
+
+    // When city changes, request a fresh update via WebSocket
+    useEffect(() => {
+        if (isConnected) {
+            requestCityUpdate(selectedCity);
+        }
+    }, [selectedCity, isConnected]);
+
+    // Backup polling (only fires if WebSocket was not delivering)
+    useEffect(() => {
+        const interval = setInterval(() => {
+            if (!isConnected) fetchData(selectedCity);
+        }, FALLBACK_REFRESH_INTERVAL);
         return () => clearInterval(interval);
-    }, [selectedCity, fetchData]);
+    }, [selectedCity, fetchData, isConnected]);
 
     const handleCitySelect = (city) => {
         setSelectedCity(city);
@@ -81,11 +164,30 @@ export default function App() {
                                 🔥
                             </div>
                             <div>
-                                <h1 className="text-lg sm:text-xl font-bold">
-                                    <span className="gradient-text">HeatShield</span>
-                                    <span className="text-white ml-1">AI</span>
-                                </h1>
-                                <p className="text-[10px] sm:text-xs text-gray-500 -mt-0.5">Heatwave Risk Intelligence Platform</p>
+                                <div className="flex items-center gap-2">
+                                    <h1 className="text-lg sm:text-xl font-bold">
+                                        <span className="gradient-text">HeatShield</span>
+                                        <span className="text-white ml-1">AI</span>
+                                    </h1>
+                                    {/* Live indicator */}
+                                    <div className={`flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider
+                                        ${isConnected
+                                            ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
+                                            : 'bg-red-500/15 text-red-400 border border-red-500/30'
+                                        }`}
+                                    >
+                                        <span className={`w-1.5 h-1.5 rounded-full ${isConnected ? 'bg-emerald-400 animate-pulse' : 'bg-red-400'}`}></span>
+                                        {isConnected ? 'LIVE' : 'OFFLINE'}
+                                    </div>
+                                </div>
+                                <p className="text-[10px] sm:text-xs text-gray-500 -mt-0.5">
+                                    Heatwave Risk Intelligence Platform
+                                    {dataSource && dataSource !== 'unknown' && (
+                                        <span className="ml-1 text-gray-600">
+                                            • {dataSource === 'mock' ? '🎲 Mock' : '🌐 Live API'}
+                                        </span>
+                                    )}
+                                </p>
                             </div>
                         </div>
 
@@ -101,7 +203,7 @@ export default function App() {
                                 className="p-2.5 rounded-xl bg-white/[0.08] hover:bg-white/[0.12] border border-white/10 
                            hover:border-white/20 transition-all duration-200 text-sm disabled:opacity-50"
                                 id="refresh-button"
-                                title="Refresh data"
+                                title="Manual refresh"
                             >
                                 <svg className={`w-4 h-4 text-gray-300 ${loading ? 'animate-spin' : ''}`}
                                     fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -139,7 +241,7 @@ export default function App() {
 
                     {/* Right Column - Chart + Map */}
                     <div className="lg:col-span-8 space-y-5">
-                        <ForecastChart forecast={forecast} />
+                        <ForecastChart forecast={forecast} city={selectedCity} />
 
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
                             <IndiaHeatmap
@@ -250,6 +352,11 @@ export default function App() {
                         {lastUpdated && (
                             <span className="ml-2 text-gray-700">
                                 • Last updated: {lastUpdated.toLocaleTimeString('en-IN')}
+                            </span>
+                        )}
+                        {isConnected && (
+                            <span className="ml-2 text-emerald-600">
+                                • 🟢 Real-time updates active
                             </span>
                         )}
                     </p>
