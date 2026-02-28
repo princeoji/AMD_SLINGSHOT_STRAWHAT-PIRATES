@@ -230,3 +230,5 @@ HeatShield-AI/
 ## 📜 License
 
 Built for the AMD Hackathon — HeatShield AI: Using technology responsibly for climate resilience and public safety.
+#   A M D _ S L I N G S H O T _ S T R A W H A T - P I R A T E S  
+ 
